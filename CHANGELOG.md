@@ -2,6 +2,30 @@
 
 All notable changes to FluxGPU. Dates are in MM-DD-YY format.
 
+## 0.3.0-dev (unreleased)
+
+The app now reports version 0.3.0-dev. This version has been compile-checked (C# 5, .NET Framework 4.8 reference assemblies, 0 warnings) and its logic tested on Linux against a fake nvidia-smi. It has **not yet been run on Windows**. See the Windows test checklist in the README (steps 11–14 are new).
+
+### Added
+- **"Using this GPU"** (P2-1): the NVIDIA card's full view lists the top 3 compute processes on the card by GPU memory, with "+N more" when there are more.
+  - Read with a separate `nvidia-smi --id=0 --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits` call about every 5 s, not inside the `-l 1` stream.
+  - Each call has a 5 s timeout. A hung call is stopped and retried with backoff, reusing the stall supervisor's process code and the job object.
+  - Polling pauses in compact view, while the window is minimized, while the NVIDIA card isn't live, and when `show_processes=0`.
+  - Full paths are shown as the file name, with the full path, PID and memory in a tooltip. Long names end in "…".
+  - `[N/A]` memory shows "n/a" with a note (normal in WDDM mode), sorts after known values, and is never shown as 0.
+  - If nvidia-smi can't read a name, FluxGPU asks Windows. If Windows refuses too, it shows "PID n (access denied)". No admin is needed.
+  - No processes shows "No compute processes (idle)". Errors show the real message and retry time, never an empty or zero list.
+- `show_processes` setting (`1` by default).
+- Log lines when polling starts or pauses (with the reason), and when the list changes between active, idle and error.
+- Tests for parsing (normal, `[N/A]`, empty, error output, access denied, commas in paths, duplicate PIDs), sorting, display names and the setting.
+
+### Changed
+- Version 0.3.0-dev in the assembly, the log and the title-bar tooltip.
+- nvidia-smi timeouts are now rate-limited in the log per query, so one slow query can't hide another.
+
+### Merging with the setup wizard branch
+The setup wizard (PR #2) also adds a "0.3.0-dev (unreleased)" section. Whichever merges second should merge the two sections under one heading, and add `show_processes` to the wizard's known settings keys (`$script:KnownSettingKeys` and the 1/0 check in `tools\Setup-FluxGPU.ps1`), or the wizard will call it an unknown key.
+
 ## 0.2.0 (11-26-26): trustworthy and safe
 
 This version has been compile-checked (C# 5, .NET Framework 4.8 reference assemblies) and its logic tested on Linux. It has **not yet been run on Windows**. See the Windows test checklist in the README.

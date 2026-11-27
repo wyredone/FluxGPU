@@ -1,6 +1,6 @@
-// FluxGPU 0.2.0 - floating GPU monitor for a Tesla P40 (read through nvidia-smi) and the AMD integrated GPU
+// FluxGPU 0.3.0-dev - floating GPU monitor for a Tesla P40 (read through nvidia-smi) and the AMD integrated GPU
 // (read through Windows performance counters and D3DKMT). Builds with the C# 5 compiler included in Windows
-// (.NET Framework 4.x, see build.cmd). Single file on purpose (v0.2); see IMPROVEMENT_PLAN.md P1-0 for the split.
+// (.NET Framework 4.x, see build.cmd). Single file on purpose (K-9); see IMPROVEMENT_PLAN.md P1-0 for the split.
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -29,9 +29,9 @@ using IOPath = System.IO.Path;
 [assembly: AssemblyProduct("FluxGPU")]
 [assembly: AssemblyDescription("Floating GPU monitor for an NVIDIA compute card and AMD integrated graphics")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 wyredone, MIT License")]
-[assembly: AssemblyVersion("0.2.0.0")]
-[assembly: AssemblyFileVersion("0.2.0.0")]
-[assembly: AssemblyInformationalVersion("0.2.0")]
+[assembly: AssemblyVersion("0.3.0.0")]
+[assembly: AssemblyFileVersion("0.3.0.0")]
+[assembly: AssemblyInformationalVersion("0.3.0-dev")]
 
 namespace GpuMonitor
 {
@@ -42,7 +42,7 @@ namespace GpuMonitor
     static class AppInfo
     {
         public const string Name = "FluxGPU";
-        public const string Version = "0.2.0";
+        public const string Version = "0.3.0-dev";
 
         public static string DataDirectory
         {
@@ -503,6 +503,180 @@ namespace GpuMonitor
     }
 
     // ------------------------------------------------------------------------------------------------
+    // "Who's using the P40" (P2-1): nvidia-smi --query-compute-apps parsing and ordering (pure, tested)
+    // ------------------------------------------------------------------------------------------------
+
+    sealed class GpuProcess
+    {
+        public int Pid;
+        public string Path;           // full path as nvidia-smi reports it; null when nvidia-smi cannot see it
+        public string WindowsName;    // name from Windows (no path) when nvidia-smi could not give one
+        public double? UsedMiB;       // null = [N/A]: the driver does not report it (normal in WDDM mode)
+    }
+
+    enum ProcessListState { Off, Connecting, Idle, Active, Error }
+
+    sealed class ProcessReport
+    {
+        public ProcessListState State;
+        public List<GpuProcess> Top = new List<GpuProcess>();
+        public int Total;
+        public bool AnyMemoryUnknown;
+        public string Message;        // Connecting / Error text, already user-facing
+
+        public static ProcessReport Status(ProcessListState state, string message)
+        {
+            return new ProcessReport { State = state, Message = message };
+        }
+    }
+
+    static class ComputeApps
+    {
+        public const string Query = "--id=0 --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits";
+        public const int TopCount = 3, MaxNameChars = 30;
+
+        // Rows are "pid, process_name, used_memory". The name is a full path and may itself contain commas,
+        // so the PID is the first field, the memory the last, and the name everything in between.
+        // Returns null (and the error text) when the output is an error message rather than rows.
+        public static List<GpuProcess> Parse(string text, out string error)
+        {
+            error = null;
+            List<GpuProcess> list = new List<GpuProcess>();
+            Dictionary<int, GpuProcess> byPid = new Dictionary<int, GpuProcess>();
+            if (text == null) return list;
+            foreach (string raw in text.Replace("\r", "").Split('\n'))
+            {
+                string line = raw.Trim();
+                if (line.Length == 0) continue;
+                if (line.StartsWith("No running", StringComparison.OrdinalIgnoreCase)) continue;   // some drivers print this instead of nothing
+                string[] f = line.Split(',');
+                int pid;
+                if (f.Length < 3 || !int.TryParse(f[0].Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out pid) || pid <= 0)
+                {
+                    error = line.Length > 300 ? line.Substring(0, 300) + "\u2026" : line;
+                    return null;
+                }
+                string name = string.Join(",", f, 1, f.Length - 2).Trim();
+                double? mem = Memory(f[f.Length - 1]);
+                GpuProcess seen;
+                if (byPid.TryGetValue(pid, out seen))
+                {
+                    // One process can hold several contexts: add up what is known.
+                    if (mem.HasValue) seen.UsedMiB = (seen.UsedMiB ?? 0) + mem.Value;
+                    continue;
+                }
+                GpuProcess p = new GpuProcess { Pid = pid, Path = NameUnavailable(name) ? null : name, UsedMiB = mem };
+                byPid[pid] = p;
+                list.Add(p);
+            }
+            return list;
+        }
+
+        // "[Insufficient Permissions]", "[N/A]", "[Not Found]" or blank: nvidia-smi could not read the name.
+        public static bool NameUnavailable(string name)
+        {
+            return string.IsNullOrEmpty(name) || name.StartsWith("[", StringComparison.Ordinal);
+        }
+
+        public static double? Memory(string s)
+        {
+            if (s == null) return null;
+            s = s.Trim();
+            if (s.EndsWith("MiB", StringComparison.OrdinalIgnoreCase)) s = s.Substring(0, s.Length - 3).Trim();
+            return NvidiaSmiCsv.Num(s, 0, 1048576);
+        }
+
+        // Biggest first; [N/A] after every known value; ties by PID so the order never flickers.
+        public static int Compare(GpuProcess a, GpuProcess b)
+        {
+            if (a.UsedMiB.HasValue != b.UsedMiB.HasValue) return a.UsedMiB.HasValue ? -1 : 1;
+            if (a.UsedMiB.HasValue)
+            {
+                int c = b.UsedMiB.Value.CompareTo(a.UsedMiB.Value);
+                if (c != 0) return c;
+            }
+            return a.Pid.CompareTo(b.Pid);
+        }
+
+        public static ProcessReport BuildReport(List<GpuProcess> all)
+        {
+            ProcessReport r = new ProcessReport { Total = all.Count };
+            if (all.Count == 0) { r.State = ProcessListState.Idle; r.Message = "No compute processes (idle)"; return r; }
+            List<GpuProcess> sorted = new List<GpuProcess>(all);
+            sorted.Sort(Compare);
+            r.State = ProcessListState.Active;
+            r.Top = sorted.GetRange(0, Math.Min(TopCount, sorted.Count));
+            foreach (GpuProcess p in r.Top) if (!p.UsedMiB.HasValue) r.AnyMemoryUnknown = true;
+            return r;
+        }
+
+        public static string FileNameOf(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return path;
+            string p = path.Trim().Trim('"');
+            int cut = Math.Max(p.LastIndexOf('\\'), p.LastIndexOf('/'));
+            string name = cut >= 0 ? p.Substring(cut + 1) : p;
+            return name.Length > 0 ? name : p;
+        }
+
+        public static string Ellipsize(string s, int max)
+        {
+            if (s == null || s.Length <= max || max < 2) return s;
+            return s.Substring(0, max - 1) + "\u2026";
+        }
+
+        public static string DisplayName(GpuProcess p)
+        {
+            if (p.Path != null) return Ellipsize(FileNameOf(p.Path), MaxNameChars);
+            if (!string.IsNullOrEmpty(p.WindowsName)) return Ellipsize(p.WindowsName, MaxNameChars);
+            return "PID " + p.Pid.ToString(CultureInfo.InvariantCulture) + " (access denied)";
+        }
+
+        public static string Tooltip(GpuProcess p)
+        {
+            string where = p.Path ?? (string.IsNullOrEmpty(p.WindowsName)
+                ? "nvidia-smi and Windows could not read this process's name (it may belong to another user or a service; FluxGPU does not run as admin)"
+                : p.WindowsName + " (nvidia-smi could not read the full path; the name comes from Windows)");
+            return where + "\nPID " + p.Pid.ToString(CultureInfo.InvariantCulture) + "   \u00B7   GPU memory " + MemoryText(p.UsedMiB);
+        }
+
+        public static string MemoryText(double? mib)
+        {
+            if (!mib.HasValue) return "n/a";
+            if (mib.Value >= 1024) return (mib.Value / 1024).ToString("0.0", CultureInfo.InvariantCulture) + " GB";
+            return mib.Value.ToString("0", CultureInfo.InvariantCulture) + " MiB";
+        }
+
+        public static string LogSummary(ProcessReport r)
+        {
+            List<string> parts = new List<string>();
+            foreach (GpuProcess p in r.Top) parts.Add(DisplayName(p) + " " + MemoryText(p.UsedMiB));
+            return r.Total + " process" + (r.Total == 1 ? "" : "es") + (parts.Count > 0 ? ": " + string.Join(", ", parts.ToArray()) : "");
+        }
+    }
+
+    // Latest-value slot for any worker result (the UI tick takes it only when it changed).
+    sealed class LatestSlot<T> where T : class
+    {
+        T latest;
+        int sequence;
+
+        public void Put(T value)
+        {
+            Interlocked.Exchange(ref latest, value);
+            Interlocked.Increment(ref sequence);
+        }
+
+        public T TakeIfNew(ref int seen)
+        {
+            int now = Volatile.Read(ref sequence);
+            if (now == seen) return null;
+            seen = now;
+            return Volatile.Read(ref latest);
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------------
     // Settings: key=value text in %LOCALAPPDATA%\FluxGPU\settings.ini, atomic writes, one-time migration
     // ------------------------------------------------------------------------------------------------
 
@@ -510,7 +684,7 @@ namespace GpuMonitor
     {
         public const int FormatVersion = 1;
         public double? Left, Top;
-        public bool Topmost = true, Compact = false, AlertSound = true, MigratedLegacy = false;
+        public bool Topmost = true, Compact = false, AlertSound = true, MigratedLegacy = false, ShowProcesses = true;
         public double? WarnC, CritC;          // null = automatic
         public double HystC = 3;
         public string NvidiaSmiPath;          // null = search the standard locations
@@ -537,6 +711,7 @@ namespace GpuMonitor
                     case "topmost": s.Topmost = Bool(val, s.Topmost, key, problems); break;
                     case "compact": s.Compact = Bool(val, s.Compact, key, problems); break;
                     case "alert_sound": s.AlertSound = Bool(val, s.AlertSound, key, problems); break;
+                    case "show_processes": s.ShowProcesses = Bool(val, s.ShowProcesses, key, problems); break;
                     case "migrated_settings_txt": s.MigratedLegacy = Bool(val, false, key, problems); break;
                     case "temp_warn_c": s.WarnC = Temp(val, key, problems); break;
                     case "temp_crit_c": s.CritC = Temp(val, key, problems); break;
@@ -586,6 +761,8 @@ namespace GpuMonitor
             b.AppendLine("temp_crit_c=" + D(CritC));
             b.AppendLine("temp_hysteresis_c=" + HystC.ToString("0.##", CultureInfo.InvariantCulture));
             b.AppendLine("alert_sound=" + (AlertSound ? "1" : "0"));
+            b.AppendLine("# Show the top 3 processes using the NVIDIA GPU (full view only). 1 = on, 0 = off.");
+            b.AppendLine("show_processes=" + (ShowProcesses ? "1" : "0"));
             b.AppendLine("# Full path to nvidia-smi.exe. Blank = System32, then Program Files\\NVIDIA Corporation\\NVSMI.");
             b.AppendLine("nvidia_smi_path=" + (NvidiaSmiPath ?? ""));
             b.AppendLine("migrated_settings_txt=" + (MigratedLegacy ? "1" : "0"));
@@ -913,7 +1090,7 @@ namespace GpuMonitor
         bool Cancelled { get { return cts.IsCancellationRequested; } }
         bool Wait(int ms) { return cts.Token.WaitHandle.WaitOne(ms); }
 
-        static void Kill(Process p)
+        internal static void Kill(Process p)
         {
             if (p == null) return;
             try { if (!p.HasExited) p.Kill(); }
@@ -1035,8 +1212,16 @@ namespace GpuMonitor
             return si;
         }
 
-        // Runs a short nvidia-smi command with a hard timeout. Both streams are drained asynchronously.
         string Capture(string exe, string args, int timeoutMs, out int exitCode, out bool timedOut)
+        {
+            return RunOnce(exe, args, timeoutMs, cts.Token, delegate { Interlocked.Increment(ref launches); }, out exitCode, out timedOut);
+        }
+
+        // Runs a short nvidia-smi command with a hard timeout (the stall-supervisor rule for one-shot commands):
+        // both streams are drained asynchronously, a hang is killed when the time runs out, the child is in the
+        // job object, and cancel kills it at once. Shared by the probe and the process-list poller.
+        public static string RunOnce(string exe, string args, int timeoutMs, CancellationToken cancel, Action started,
+            out int exitCode, out bool timedOut)
         {
             exitCode = -1; timedOut = false;
             StringBuilder output = new StringBuilder();
@@ -1050,24 +1235,24 @@ namespace GpuMonitor
             };
             p.OutputDataReceived += collect;
             p.ErrorDataReceived += collect;
-            bool started = false;
+            bool running = false;
             try
             {
                 p.Start();
-                started = true;
-                Interlocked.Increment(ref launches);
+                running = true;
+                if (started != null) started();
                 ChildProcesses.Register(p);
                 p.BeginOutputReadLine();
                 p.BeginErrorReadLine();
                 long until = Mono.Ms + timeoutMs;
                 while (!p.HasExited)
                 {
-                    if (Wait(50)) { Kill(p); break; }
+                    if (cancel.WaitHandle.WaitOne(50)) { Kill(p); break; }
                     if (Mono.Ms > until)
                     {
                         timedOut = true;
                         Kill(p);
-                        Log.Warn("nvidia-smi " + args + " timed out after " + timeoutMs / 1000 + " s and was stopped");
+                        Log.Limited("smi-timeout-" + args, "WARN", "nvidia-smi " + args + " timed out after " + timeoutMs / 1000 + " s and was stopped");
                         break;
                     }
                 }
@@ -1077,7 +1262,7 @@ namespace GpuMonitor
             catch (InvalidOperationException ex) { lock (outGate) output.AppendLine(ex.Message); }
             finally
             {
-                if (started) { ChildProcesses.Unregister(p); Kill(p); }
+                if (running) { ChildProcesses.Unregister(p); Kill(p); }
                 p.Dispose();
             }
             lock (outGate) return output.ToString();
@@ -1225,6 +1410,174 @@ namespace GpuMonitor
         {
             s = (s ?? "").Trim();
             return s.Length > 300 ? s.Substring(0, 300) + "\u2026" : s;
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    // "Who's using the P40" (P2-1): a separate low-rate poll of --query-compute-apps, never part of the
+    // -l 1 stream. Runs only while Active (full view, window not minimized, setting on, NVIDIA card live).
+    // Each poll has a hard timeout; a hang is killed and retried with backoff, like the stall supervisor.
+    // ------------------------------------------------------------------------------------------------
+
+    sealed class ProcessPoller
+    {
+        public const int IntervalMs = 5000, TimeoutMs = 5000;
+
+        readonly Action<ProcessReport> report;
+        readonly string overridePath;
+        readonly Func<int, string> windowsName;   // process name from Windows when nvidia-smi cannot read it
+        readonly CancellationTokenSource cts = new CancellationTokenSource();
+        readonly AutoResetEvent wake = new AutoResetEvent(false);
+        Thread thread;
+        volatile bool active;
+        int launches, timeouts;
+
+        public ProcessPoller(Action<ProcessReport> report, string overridePath, Func<int, string> windowsName)
+        {
+            this.report = report;
+            this.overridePath = overridePath;
+            this.windowsName = windowsName;
+        }
+
+        public int Launches { get { return Volatile.Read(ref launches); } }
+        public int Timeouts { get { return Volatile.Read(ref timeouts); } }
+
+        // Turning it on polls at once; turning it off stops polling after the current poll (at most TimeoutMs).
+        public bool Active
+        {
+            get { return active; }
+            set
+            {
+                bool was = active;
+                active = value;
+                if (value && !was) wake.Set();
+            }
+        }
+
+        public void Start()
+        {
+            thread = new Thread(Run);
+            thread.IsBackground = true;
+            thread.Name = "FluxGPU process-list poller";
+            thread.Start();
+        }
+
+        public void Stop(int joinMs)
+        {
+            cts.Cancel();   // a running poll sees this within 50 ms and kills its nvidia-smi
+            wake.Set();
+            if (thread != null && !thread.Join(joinMs)) Log.Warn("Process-list poller did not stop within " + joinMs + " ms");
+        }
+
+        bool Cancelled { get { return cts.IsCancellationRequested; } }
+
+        // True when cancelled. Wakes early when Active is switched on.
+        bool Wait(int ms)
+        {
+            WaitHandle.WaitAny(new WaitHandle[] { cts.Token.WaitHandle, wake }, ms);
+            return Cancelled;
+        }
+
+        public static string WindowsProcessName(int pid)
+        {
+            try
+            {
+                using (Process p = Process.GetProcessById(pid)) return p.ProcessName + ".exe";
+            }
+            catch (ArgumentException) { return null; }          // exited
+            catch (InvalidOperationException) { return null; }
+            catch (Win32Exception) { return null; }
+            catch (NotSupportedException) { return null; }
+        }
+
+        void Run()
+        {
+            Backoff backoff = new Backoff();
+            string lastState = null;
+            while (!Cancelled)
+            {
+                try
+                {
+                    if (!active) { if (Wait(60000)) break; continue; }
+                    wake.Reset();   // a stale "switched on" signal must not cause an extra poll right after this one
+                    int delay = IntervalMs;
+                    ProcessReport r;
+                    List<string> looked = new List<string>();
+                    string exe = NvidiaSmiLocator.Find(overridePath, looked);
+                    if (exe == null)
+                    {
+                        delay = Math.Max(IntervalMs, backoff.NextTransientMs());
+                        r = ProcessReport.Status(ProcessListState.Error, "Process list unavailable: nvidia-smi not found \u2014 checking again in " + delay / 1000 + " s");
+                    }
+                    else
+                    {
+                        int code;
+                        bool timedOut;
+                        string text = NvidiaSource.RunOnce(exe, ComputeApps.Query, TimeoutMs, cts.Token,
+                            delegate { Interlocked.Increment(ref launches); }, out code, out timedOut);
+                        if (Cancelled) break;
+                        string error = null;
+                        List<GpuProcess> all = null;
+                        if (timedOut)
+                        {
+                            Interlocked.Increment(ref timeouts);
+                            error = "nvidia-smi did not answer within " + TimeoutMs / 1000 + " s and was stopped";
+                        }
+                        else
+                        {
+                            all = ComputeApps.Parse(text, out error);
+                            if (code != 0)
+                            {
+                                string first = FirstLine(text);
+                                error = "nvidia-smi exited (code " + code + ")" + (first.Length > 0 ? ": " + first : "");
+                                all = null;
+                            }
+                        }
+                        if (all == null)
+                        {
+                            delay = Math.Max(IntervalMs, backoff.NextTransientMs());
+                            r = ProcessReport.Status(ProcessListState.Error, "Process list: " + error + " \u2014 retrying in " + delay / 1000 + " s");
+                        }
+                        else
+                        {
+                            backoff.Reset();
+                            foreach (GpuProcess p in all)
+                                if (p.Path == null && windowsName != null) p.WindowsName = windowsName(p.Pid);
+                            r = ComputeApps.BuildReport(all);
+                        }
+                    }
+                    report(r);
+                    LogState(ref lastState, r);
+                    if (Wait(delay)) break;
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("Process-list poller error", ex);
+                    report(ProcessReport.Status(ProcessListState.Error, "Process list: internal error (" + ex.Message + ") \u2014 retrying in 10 s"));
+                    if (Wait(10000)) break;
+                }
+            }
+        }
+
+        static string FirstLine(string text)
+        {
+            foreach (string l in (text ?? "").Replace("\r", "").Split('\n'))
+                if (l.Trim().Length > 0) return l.Trim().Length > 300 ? l.Trim().Substring(0, 300) + "\u2026" : l.Trim();
+            return "";
+        }
+
+        static void LogState(ref string last, ProcessReport r)
+        {
+            string state = r.State.ToString().ToLowerInvariant();
+            if (state == last)
+            {
+                if (r.State == ProcessListState.Error) Log.Limited("procs-error", "WARN", "P40 process list still error: " + r.Message);
+                return;
+            }
+            last = state;
+            if (r.State == ProcessListState.Error) Log.Warn("P40 process list -> error: " + r.Message);
+            else if (r.State == ProcessListState.Idle) Log.Info("P40 process list -> idle (no compute processes)");
+            else Log.Info("P40 process list -> active (" + ComputeApps.LogSummary(r) + ")");
         }
     }
 
@@ -1590,6 +1943,13 @@ namespace GpuMonitor
         readonly bool isNvidia;
         double memFraction;
         bool compactMode;
+        // "Using this GPU" (P2-1, NVIDIA card only; part of the full view, so compact view hides it).
+        readonly StackPanel procPanel;
+        readonly Grid procGrid;
+        readonly TextBlock procHead, procStatus, procNote;
+        readonly TextBlock[] procNames = new TextBlock[ComputeApps.TopCount], procMems = new TextBlock[ComputeApps.TopCount];
+        bool procEnabled;
+        ProcessReport procLast;
         public long LastGoodMs = -1;          // Mono.Ms of the last live sample
         public DateTime LastGoodLocal;
         public SourceState State = SourceState.Connecting;
@@ -1670,7 +2030,92 @@ namespace GpuMonitor
             info.Margin = new Thickness(0, 8, 0, 0);
             info.Visibility = Visibility.Collapsed;
             detail.Children.Add(info);
+
+            if (isNvidia)
+            {
+                procPanel = new StackPanel { Margin = new Thickness(0, 10, 0, 0), Visibility = Visibility.Collapsed };
+                procHead = Ui.Label("Using this GPU", 11, Theme.Sub, FontWeights.SemiBold);
+                procPanel.Children.Add(procHead);
+                procGrid = new Grid { Margin = new Thickness(0, 3, 0, 0) };
+                procGrid.ColumnDefinitions.Add(new ColumnDefinition());
+                procGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                for (int i = 0; i < ComputeApps.TopCount; i++)
+                {
+                    procGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                    procNames[i] = Ui.Label("", 12, Theme.Text, FontWeights.Normal);
+                    procNames[i].TextTrimming = TextTrimming.CharacterEllipsis;   // long names: ellipsis, full path in the tooltip
+                    procMems[i] = Ui.Label("", 12, Theme.Text, FontWeights.SemiBold);
+                    procMems[i].Margin = new Thickness(10, 0, 0, 0);
+                    procMems[i].HorizontalAlignment = HorizontalAlignment.Right;
+                    Grid.SetRow(procNames[i], i);
+                    Grid.SetRow(procMems[i], i);
+                    Grid.SetColumn(procMems[i], 1);
+                    procGrid.Children.Add(procNames[i]);
+                    procGrid.Children.Add(procMems[i]);
+                }
+                procPanel.Children.Add(procGrid);
+                procStatus = Ui.Label("", 11.5, Theme.Sub, FontWeights.Normal);
+                procStatus.TextWrapping = TextWrapping.Wrap;
+                procStatus.TextTrimming = TextTrimming.None;
+                procPanel.Children.Add(procStatus);
+                procNote = Ui.Label("n/a = the driver does not report this process's memory (normal in WDDM mode)", 10.5, Theme.Sub, FontWeights.Normal);
+                procNote.TextWrapping = TextWrapping.Wrap;
+                procNote.TextTrimming = TextTrimming.None;
+                procNote.Margin = new Thickness(0, 2, 0, 0);
+                procNote.Visibility = Visibility.Collapsed;
+                procPanel.Children.Add(procNote);
+                detail.Children.Add(procPanel);
+            }
             detail.Opacity = StaleOpacity;
+        }
+
+        public void SetProcessesEnabled(bool on)
+        {
+            procEnabled = on;
+            if (on && procLast == null) ShowProcesses(ProcessReport.Status(ProcessListState.Connecting, "Checking which processes use this GPU\u2026"));
+            RefreshProcessVisibility();
+        }
+
+        // Shown only while the card itself is live: an NVIDIA error already explains itself above.
+        void RefreshProcessVisibility()
+        {
+            if (procPanel == null) return;
+            procPanel.Visibility = procEnabled && State == SourceState.Live ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        // Polling resumed after compact view or minimize: keep the old list, dimmed, until the next result.
+        public void MarkProcessesPending()
+        {
+            if (procPanel != null && procLast != null) procPanel.Opacity = StaleOpacity;
+        }
+
+        public void ShowProcesses(ProcessReport r)
+        {
+            if (procPanel == null || r == null) return;
+            procLast = r;
+            procPanel.Opacity = 1;
+            int shown = r.State == ProcessListState.Active ? r.Top.Count : 0;
+            for (int i = 0; i < ComputeApps.TopCount; i++)
+            {
+                bool on = i < shown;
+                procNames[i].Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+                procMems[i].Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+                if (!on) { procNames[i].ToolTip = null; procMems[i].ToolTip = null; continue; }
+                GpuProcess p = r.Top[i];
+                procNames[i].Text = ComputeApps.DisplayName(p);
+                procNames[i].Foreground = p.Path == null && string.IsNullOrEmpty(p.WindowsName) ? Theme.Sub : Theme.Text;
+                procMems[i].Text = ComputeApps.MemoryText(p.UsedMiB);
+                procMems[i].Foreground = p.UsedMiB.HasValue ? Theme.Text : Theme.Sub;
+                string tip = ComputeApps.Tooltip(p);
+                procNames[i].ToolTip = tip;
+                procMems[i].ToolTip = tip;
+            }
+            procGrid.Visibility = shown > 0 ? Visibility.Visible : Visibility.Collapsed;
+            procHead.Text = "Using this GPU" + (shown > 0 && r.Total > shown ? "   \u00B7   +" + (r.Total - shown) + " more" : "");
+            procStatus.Text = r.Message ?? "";
+            procStatus.Foreground = r.State == ProcessListState.Error ? Theme.Warn : Theme.Sub;
+            procStatus.Visibility = shown == 0 ? Visibility.Visible : Visibility.Collapsed;
+            procNote.Visibility = shown > 0 && r.AnyMemoryUnknown ? Visibility.Visible : Visibility.Collapsed;
         }
 
         public void SetCompact(bool on)
@@ -1702,6 +2147,7 @@ namespace GpuMonitor
             memText.Text = (isNvidia ? "Memory" : "Shared memory") + "   n/a";
             foreach (TextBlock v in values) { v.Text = "--"; v.Foreground = Theme.Text; }
             info.Visibility = Visibility.Collapsed;
+            RefreshProcessVisibility();
             history.Add(null);   // a gap in the graph, not a drop to 0
             if (history.Count > Points) history.RemoveAt(0);
             DrawHistory();
@@ -1731,6 +2177,7 @@ namespace GpuMonitor
             status.Visibility = Visibility.Collapsed;
             detail.Opacity = 1; compact.Opacity = 1;
             compact.Visibility = compactMode ? Visibility.Visible : Visibility.Collapsed;
+            RefreshProcessVisibility();
             if (s.Name != null) title.Text = s.Name.Replace("(TM)", "");
             load.Text = F(s.Util, "0", "%");
             history.Add(s.Util);
@@ -1941,6 +2388,10 @@ namespace GpuMonitor
         int nvidiaSeen, amdSeen, ticks;
         readonly NvidiaSource nvidiaSource;
         readonly AmdSource amdSource;
+        readonly ProcessPoller processPoller;
+        readonly LatestSlot<ProcessReport> procSlot = new LatestSlot<ProcessReport>();
+        int procSeen;
+        string pollState;
         readonly AlertManager alerts;
         readonly TelemetryWatch telemetry;
         TempAlarm alarm;
@@ -2036,6 +2487,13 @@ namespace GpuMonitor
             nvidiaSource.Start();
             amdSource.Start();
 
+            // P2-1: separate low-rate poll of the compute processes, only while it can be seen.
+            processPoller = new ProcessPoller(procSlot.Put, nvidiaSmiOverride ?? settings.NvidiaSmiPath, ProcessPoller.WindowsProcessName);
+            processPoller.Start();
+            nvidia.SetProcessesEnabled(settings.ShowProcesses);
+            StateChanged += delegate { UpdatePolling(); };
+            UpdatePolling();
+
             DispatcherTimer timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(UiTickMs) };
             timer.Tick += delegate { Tick(); };
             timer.Start();
@@ -2103,8 +2561,35 @@ namespace GpuMonitor
             CheckStale(nvidia, "NVIDIA", now);
             CheckStale(amd, "AMD", now);
 
+            ProcessReport pr = procSlot.TakeIfNew(ref procSeen);
+            if (pr != null)
+            {
+                try { nvidia.ShowProcesses(pr); }
+                catch (Exception ex) { Log.Limited("proc-update", "ERROR", "Process list update failed: " + ex.GetType().Name + ": " + ex.Message); }
+            }
+            UpdatePolling();
+
             if (telemetry.Update(now) != 0) alerts.SetTelemetryLost(telemetry.Lost, telemetry.SinceGoodMs(now));
             if (telemetry.Lost) alerts.UpdateLostText(telemetry.SinceGoodMs(now));
+        }
+
+        // Polls only when the list can be seen: setting on, full view, not minimized, NVIDIA card live.
+        void UpdatePolling()
+        {
+            if (processPoller == null) return;
+            string reason = !settings.ShowProcesses ? "off in settings (show_processes=0)"
+                : compactMode ? "compact view"
+                : WindowState == WindowState.Minimized ? "window minimized"
+                : nvidia.State != SourceState.Live ? "NVIDIA card not live"
+                : null;
+            string state = reason ?? "on";
+            if (state == pollState) return;
+            bool first = pollState == null;
+            pollState = state;
+            if (reason == null && !processPoller.Active) nvidia.MarkProcessesPending();
+            processPoller.Active = reason == null;
+            if (reason == null) Log.Info("P40 process list polling on (every " + ProcessPoller.IntervalMs / 1000 + " s)");
+            else if (!first || reason.StartsWith("off", StringComparison.Ordinal)) Log.Info("P40 process list polling paused: " + reason);
         }
 
         static void CheckStale(GpuCard card, string which, long now)
@@ -2133,6 +2618,7 @@ namespace GpuMonitor
             stopped = true;
             Log.Info("Shutting down: " + why);
             nvidiaSource.Stop(JoinMs);
+            if (processPoller != null) processPoller.Stop(JoinMs);
             amdSource.Stop(JoinMs);
             ChildProcesses.KillAll();
             if (!snapshot) SaveSettings();
@@ -2179,6 +2665,7 @@ namespace GpuMonitor
             amd.SetCompact(on);
             sizeIcon.Text = on ? "\uE740" : "\uE73F";
             ((Border)sizeIcon.Parent).ToolTip = on ? "Full view" : "Compact view";
+            UpdatePolling();
         }
 
         void ApplySettings()

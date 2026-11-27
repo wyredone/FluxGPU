@@ -9,7 +9,7 @@ A small floating GPU monitor for Windows 11 that shows an NVIDIA compute card an
 
 It was made for a Tesla P40, which runs in TCC mode and so normally does not appear in Task Manager.
 
-Version 0.2.0. See [CHANGELOG.md](CHANGELOG.md).
+Version 0.3.0-dev (in development; adds "Using this GPU"). See [CHANGELOG.md](CHANGELOG.md).
 
 ## What it shows
 
@@ -22,6 +22,20 @@ Version 0.2.0. See [CHANGELOG.md](CHANGELOG.md).
 | Core clock | "Drv power": the raw driver percentage (meaning unverified, never alerted on) |
 | PCIe link now and its maximum generation, and TCC or WDDM mode | Busiest engine |
 | Throttle badges: HW THERMAL, SW THERMAL, POWER BRAKE, HW SLOWDOWN | |
+| "Using this GPU": the top 3 processes on the card, by GPU memory (full view only) | |
+
+### Using this GPU (full view)
+
+The NVIDIA card lists the 3 processes using the most GPU memory, for example `llama-server.exe   18.0 GB`. If more processes are running, the heading says "+N more".
+
+- Names are shortened to the file name. Hover over a name to see the full path, the PID and the memory.
+- Long names end in "…".
+- **n/a** means the driver doesn't report that process's memory. This is normal in WDDM mode. Those processes are listed after the ones with known memory and are never shown as 0.
+- **PID 1234 (access denied)** means neither nvidia-smi nor Windows would give FluxGPU the name, usually for a service or another user's process. FluxGPU never asks for admin to read it.
+- **No compute processes (idle)** means nothing is using the card.
+- If the list can't be read, you see the real reason and when it will try again, never an empty or zero list.
+
+The list is read with a separate `nvidia-smi --query-compute-apps` call about every 5 s. Each call gets 5 s to answer, or it is stopped. Polling pauses in compact view, while the window is minimized and while the NVIDIA card isn't live. Turn the list off with `show_processes=0`.
 
 - Stays on top of other windows (the pin button turns this off)
 - Full and compact views
@@ -111,6 +125,7 @@ The first time version 0.2 starts, it copies the position and view from the old 
 | `temp_warn_c`, `temp_crit_c` | Your own NVIDIA alert thresholds in °C (30–120). Blank means automatic. Warn must be lower than critical |
 | `temp_hysteresis_c` | How far below a threshold the temperature must drop before the alert clears (default 3) |
 | `alert_sound` | `1` plays a sound on alerts, `0` keeps them silent |
+| `show_processes` | `1` (default) shows "Using this GPU" in full view, `0` hides it and stops the 5 s process check |
 | `nvidia_smi_path` | Full path to nvidia-smi.exe. Blank searches `C:\Windows\System32`, then `C:\Program Files\NVIDIA Corporation\NVSMI` |
 | `left`, `top`, `topmost`, `compact` | Window position and view, saved automatically |
 
@@ -121,6 +136,7 @@ Log lines look like `11-26-26 05:41 PM [WARN] NVIDIA source state -> error: …`
 - source state changes (connecting, live, stale, error, recovered)
 - every alert raised and cleared
 - nvidia-smi restarts by the stall supervisor
+- the "Using this GPU" list: polling on or paused (and why), and changes between active, idle and error
 - crashes
 
 ## Troubleshooting
@@ -135,10 +151,14 @@ Log lines look like `11-26-26 05:41 PM [WARN] NVIDIA source state -> error: …`
 | AMD card says "No AMD adapter found" | Check that the AMD graphics are enabled in Device Manager and in the BIOS |
 | AMD card shows an error about performance counters, or stays empty | The Windows performance counters may be damaged. In an admin terminal run `lodctr /R`, then restart FluxGPU. Counter names are only matched in English, so non-English Windows is not supported yet |
 | "AMD adapter changed, reconnecting…" | Expected after a driver update or after disabling and enabling the device. It clears by itself |
+| "Using this GPU" shows "PID 1234 (access denied)" | Normal for services and other users' processes. Hover for the PID and look it up in Task Manager's Details tab. Running FluxGPU as admin isn't needed or recommended |
+| "Using this GPU" shows n/a for memory | Normal in WDDM mode: the driver doesn't report per-process memory. In TCC mode it should show a value |
+| "Process list: nvidia-smi did not answer within 5 s and was stopped" | The driver is slow to answer the process query. FluxGPU retries with backoff and the main readings keep working. If it repeats, set `show_processes=0` and report it |
+| "Process list: …" with any other error | The text is the real error from nvidia-smi. Your driver may not support `--query-compute-apps`; set `show_processes=0` to hide the list |
 | Build fails with a warning | Run `set FLUXGPU_ALLOW_WARNINGS=1` then `build.cmd`, and report the warning |
 | Anything else | Open the newest file in `%LOCALAPPDATA%\FluxGPU\logs` |
 
-## Windows test checklist (about 5 minutes)
+## Windows test checklist (about 8 minutes)
 
 Run this on the P40 PC before accepting a version. Write down pass or fail for each step.
 
@@ -156,11 +176,16 @@ Run this on the P40 PC before accepting a version. Write down pass or fail for e
 8. **Settings survive restart:** move the window, toggle the pin and compact view, close FluxGPU and start it again. Everything is as you left it. `%LOCALAPPDATA%\FluxGPU\settings.ini` exists.
 9. **No orphans:** with FluxGPU running, end `FluxGPU.exe` in Task Manager. No `nvidia-smi.exe` stays running.
 10. Open the newest log in `%LOCALAPPDATA%\FluxGPU\logs`. The lines use the `MM-DD-YY HH:MM AM/PM` time format and record the steps above.
+11. **Using this GPU, idle:** with nothing running on the P40, the full view shows "No compute processes (idle)". Compare with `nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv`.
+12. **Using this GPU, busy:** start something on the P40 (for example a model server). Within about 5 s it appears with its file name and GPU memory, largest first, and matches the `nvidia-smi` command above. Hover over the name: the tooltip shows the full path and PID.
+13. **Pause:** switch to compact view, and minimize the window. In Task Manager's Details tab, no new `nvidia-smi.exe` with `--query-compute-apps` starts every 5 s (only the main one keeps running). The log says "P40 process list polling paused: compact view" or "window minimized". Back in full view, the list returns within about 5 s.
+14. **Off switch:** close FluxGPU, set `show_processes=0`, start it. The list is gone and the log says "paused: off in settings". Set it back to `1` afterwards.
 
 ## Known limits
 
-- Tested on one PC only: Windows 11 Pro with a Tesla P40 and AMD Radeon integrated graphics. Version 0.2 was compile-checked and its logic tested on Linux, but has not yet been run on Windows. Use the checklist above.
+- Tested on one PC only: Windows 11 Pro with a Tesla P40 and AMD Radeon integrated graphics. Versions 0.2 and 0.3.0-dev were compile-checked and their logic tested on Linux, but have not yet been run on Windows. Use the checklist above.
 - Only the first NVIDIA GPU (index 0) and the first AMD adapter are shown.
+- "Using this GPU" lists compute processes only (what `--query-compute-apps` reports), not graphics-only processes. In WDDM mode memory is often n/a.
 - AMD load and memory come from Windows performance counters, whose names the app expects in English.
 - The AMD "Drv power" value is shown as the driver reports it. Its meaning has not been verified, so it is not shown in compact view and never alerted on.
 - No toast notifications or tray icon yet.

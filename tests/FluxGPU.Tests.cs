@@ -1,5 +1,5 @@
 // FluxGPU pure-logic tests. No test framework and no project file: compiled together with FluxGPU.cs by
-// tests\run-tests.cmd using the same in-box C# 5 compiler as build.cmd. Exit code 0 = all passed.
+// "build.cmd test" using the same in-box C# 5 compiler as build.cmd. Exit code 0 = all passed.
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -229,6 +229,15 @@ namespace GpuMonitor.Tests
                 Eq(false, back.Topmost, "topmost"); Eq(true, back.Compact, "compact");
                 Eq((double?)80, back.WarnC, "warn"); Eq((double?)null, back.CritC, "crit auto");
                 Eq(2.5, back.HystC, "hysteresis");
+                Eq(true, back.ShowProcesses, "process list on by default");
+                s.ShowProcesses = false;
+                back = AppSettings.Parse(s.Serialize(), problems);
+                Eq(false, back.ShowProcesses, "process list off round trip");
+                Eq(0, problems.Count, "still no problems");
+                Check(s.Serialize().Contains("show_processes=0"), "show_processes written");
+                back = AppSettings.Parse("show_processes=maybe", problems);
+                Eq(true, back.ShowProcesses, "bad value keeps the default (on)");
+                Eq(1, problems.Count, "bad show_processes reported");
             });
             Run("settings: bad values ignored and reported", delegate
             {
@@ -308,6 +317,107 @@ namespace GpuMonitor.Tests
             {
                 Eq("11-26-26 05:41 PM", Log.Stamp(new DateTime(2026, 11, 26, 17, 41, 9)), "afternoon");
                 Eq("01-02-27 09:05 AM", Log.Stamp(new DateTime(2027, 1, 2, 9, 5, 0)), "morning");
+            });
+            // ---------------- "Who's using the P40" (P2-1) ----------------
+            Run("procs: normal rows, full paths, sorted by memory, top 3", delegate
+            {
+                string err;
+                List<GpuProcess> all = ComputeApps.Parse(
+                    "4120, C:\\Users\\Kevin\\llama.cpp\\llama-server.exe, 18432\r\n" +
+                    "880, C:\\Program Files\\Ollama\\ollama.exe, 512\n" +
+                    "9001, C:\\Python312\\python.exe, 2048\n" +
+                    "77, C:\\Tools\\tiny.exe, 12\n", out err);
+                Check(all != null, "parsed");
+                Eq((string)null, err, "no error");
+                Eq(4, all.Count, "four processes");
+                Eq("C:\\Program Files\\Ollama\\ollama.exe", all[1].Path, "full path kept");
+                ProcessReport r = ComputeApps.BuildReport(all);
+                Eq(ProcessListState.Active, r.State, "active");
+                Eq(4, r.Total, "total");
+                Eq(3, r.Top.Count, "top 3 only");
+                Eq(4120, r.Top[0].Pid, "biggest first");
+                Eq(9001, r.Top[1].Pid, "second");
+                Eq(880, r.Top[2].Pid, "third");
+                Eq("llama-server.exe", ComputeApps.DisplayName(r.Top[0]), "file name shown");
+                Eq("18.0 GB", ComputeApps.MemoryText(r.Top[0].UsedMiB), "GB above 1 GiB");
+                Eq("512 MiB", ComputeApps.MemoryText(r.Top[2].UsedMiB), "MiB below 1 GiB");
+                Check(ComputeApps.Tooltip(r.Top[0]).StartsWith("C:\\Users\\Kevin\\llama.cpp\\llama-server.exe\nPID 4120", StringComparison.Ordinal), "tooltip has the full path and PID");
+                Check(!r.AnyMemoryUnknown, "all memory known");
+            });
+            Run("procs: [N/A] memory sorts last and never becomes 0", delegate
+            {
+                string err;
+                List<GpuProcess> all = ComputeApps.Parse("10, C:\\a\\one.exe, [N/A]\n20, C:\\b\\two.exe, 300\n5, C:\\c\\three.exe, [Not Supported]\n", out err);
+                Eq((double?)null, all[0].UsedMiB, "[N/A] is null");
+                ProcessReport r = ComputeApps.BuildReport(all);
+                Eq(20, r.Top[0].Pid, "known memory first");
+                Eq(5, r.Top[1].Pid, "unknowns by PID");
+                Eq(10, r.Top[2].Pid, "unknowns by PID (2)");
+                Eq("n/a", ComputeApps.MemoryText(r.Top[1].UsedMiB), "shown as n/a");
+                Check(r.AnyMemoryUnknown, "note shown");
+                Eq((double?)null, ComputeApps.Memory("-1"), "negative rejected");
+                Eq((double?)null, ComputeApps.Memory("NaN"), "NaN rejected");
+                Eq((double?)1234, ComputeApps.Memory("1234 MiB"), "units tolerated");
+            });
+            Run("procs: no processes is idle, not an error", delegate
+            {
+                string err;
+                foreach (string text in new[] { "", "\r\n", "No running processes found\n" })
+                {
+                    List<GpuProcess> all = ComputeApps.Parse(text, out err);
+                    Check(all != null && all.Count == 0, "empty list for \"" + text.Trim() + "\"");
+                    ProcessReport r = ComputeApps.BuildReport(all);
+                    Eq(ProcessListState.Idle, r.State, "idle");
+                    Eq("No compute processes (idle)", r.Message, "idle text");
+                    Eq(0, r.Top.Count, "no rows, no zeros");
+                }
+            });
+            Run("procs: error output is an error, never rows of zeros", delegate
+            {
+                string err;
+                Check(ComputeApps.Parse("Failed to initialize NVML: Insufficient Permissions\n", out err) == null, "NVML error");
+                Eq("Failed to initialize NVML: Insufficient Permissions", err, "error text kept");
+                Check(ComputeApps.Parse("No devices were found", out err) == null, "no devices");
+                Check(ComputeApps.Parse("Field \"process_name\" is not a valid field to query.", out err) == null, "invalid field");
+                Check(ComputeApps.Parse("10, C:\\a.exe, 5\nUnable to determine the device handle for GPU0000:03:00.0: Unknown Error", out err) == null, "error after a row");
+                Check(ComputeApps.Parse("0, x.exe, 5", out err) == null, "PID 0 rejected");
+                Check(ComputeApps.Parse("12, 34", out err) == null, "too few fields");
+            });
+            Run("procs: access denied, commas in paths, long names, duplicate PIDs", delegate
+            {
+                string err;
+                List<GpuProcess> all = ComputeApps.Parse(
+                    "31, [Insufficient Permissions], 1024\n" +
+                    "32, C:\\Odd, Folder\\my, app.exe, 64\n" +
+                    "33, C:\\AI\\a-really-long-model-server-name-that-keeps-going.exe, 10\n" +
+                    "33, C:\\AI\\a-really-long-model-server-name-that-keeps-going.exe, 20\n" +
+                    "34, , [N/A]\n", out err);
+                Eq(4, all.Count, "duplicate PID merged");
+                Eq((string)null, all[0].Path, "insufficient permissions = no path");
+                Eq("PID 31 (access denied)", ComputeApps.DisplayName(all[0]), "access denied shown plainly");
+                all[0].WindowsName = "secret.exe";
+                Eq("secret.exe", ComputeApps.DisplayName(all[0]), "Windows name used when available");
+                Check(ComputeApps.Tooltip(all[0]).Contains("name comes from Windows"), "tooltip explains the source");
+                Eq("C:\\Odd, Folder\\my, app.exe", all[1].Path, "commas inside the path kept");
+                Eq((double?)64, all[1].UsedMiB, "memory is the last field");
+                Eq("my, app.exe", ComputeApps.DisplayName(all[1]), "file name after the last backslash");
+                Eq((double?)30, all[2].UsedMiB, "contexts of one PID added up");
+                string shown = ComputeApps.DisplayName(all[2]);
+                Eq(ComputeApps.MaxNameChars, shown.Length, "long name shortened");
+                Check(shown.EndsWith("\u2026", StringComparison.Ordinal), "ends with an ellipsis");
+                Check(ComputeApps.Tooltip(all[2]).StartsWith("C:\\AI\\a-really-long-model-server-name-that-keeps-going.exe", StringComparison.Ordinal), "full path in the tooltip");
+                Eq("PID 34 (access denied)", ComputeApps.DisplayName(all[3]), "blank name");
+                Eq("ollama", ComputeApps.FileNameOf("ollama"), "plain name");
+                Eq("x.exe", ComputeApps.FileNameOf("\"C:\\q\\x.exe\""), "quoted path");
+                Eq("abc", ComputeApps.Ellipsize("abc", 30), "short name unchanged");
+            });
+            Run("procs: query is separate from the -l 1 stream and has a timeout", delegate
+            {
+                Check(ComputeApps.Query.Contains("--query-compute-apps=pid,process_name,used_memory"), "fields");
+                Check(ComputeApps.Query.Contains("--format=csv,noheader,nounits"), "format");
+                Check(!ComputeApps.Query.Contains("-l "), "one-shot, not looping");
+                Check(ProcessPoller.TimeoutMs > 0 && ProcessPoller.TimeoutMs <= ProcessPoller.IntervalMs, "timeout no longer than the interval");
+                Eq(5000, ProcessPoller.IntervalMs, "every 5 s");
             });
             Run("native: struct sizes match the Windows headers (x64)", delegate
             {
