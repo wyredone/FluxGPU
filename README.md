@@ -72,3 +72,7 @@ git clone https://github.com/wyredone/FluxGPU.git
 | Cyan on dark backgrounds | `#12E9FF` |
 | Cyan on light backgrounds | `#007F96` |
 | Text on light backgrounds | `#141924` |
+
+## License
+
+[MIT](LICENSE)
