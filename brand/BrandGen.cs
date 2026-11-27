@@ -229,6 +229,12 @@ static class BrandGen
 
     static void Main(string[] args)
     {
+        if (args.Length < 1 || !Directory.Exists(args[0]))
+        {
+            Console.Error.WriteLine("Usage: BrandGen.exe <existing output folder>   (build.cmd brand runs it for you)");
+            Environment.ExitCode = 2;
+            return;
+        }
         string dir = args[0];
         File.WriteAllText(System.IO.Path.Combine(dir, "fluxgpu-icon.svg"), Svg(Icon(2), 512, 512));
         foreach (int n in new[] { 256, 512, 1024 }) File.WriteAllBytes(System.IO.Path.Combine(dir, "fluxgpu-icon-" + n + ".png"), Png(IconBitmap(n)));
