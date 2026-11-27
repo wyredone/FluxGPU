@@ -1,0 +1,6 @@
+# Build output
+*.exe
+
+# Local state and old builds
+settings.txt
+previous/
