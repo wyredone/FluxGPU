@@ -2,6 +2,26 @@
 
 All notable changes to FluxGPU. Dates are in MM-DD-YY format.
 
+## 0.3.0-dev (unreleased)
+
+The app itself is unchanged from 0.2.0 (it still reports version 0.2.0). This version adds the setup wizard (plan item P1-1). It has been syntax-checked, analyzed and tested with mocks; it has **not yet been run on Windows**.
+
+### Added
+- **Setup wizard**: `setup.cmd` runs `tools\Setup-FluxGPU.ps1`. Numbered steps, one numbered question at a time, plain messages, and a PASS / WARN / FAIL summary:
+  1. Check Windows (64-bit Windows 11; Windows 10 gets a warning) and unblock downloaded files in the FluxGPU folder.
+  2. Find `csc.exe` (.NET Framework 4.x) and the installed version.
+  3. Find nvidia-smi with the app's own search order and run a 10 s test query. Find the AMD adapter and check the Windows GPU counters.
+  4. `build.cmd` and `build.cmd test`.
+  5. Optional Start menu and desktop shortcuts, and start with Windows (per-user `HKCU` Run entry).
+  6. Optional settings: nvidia-smi path, temperature thresholds and alert sound. They're checked with the app's rules and written atomically, with a `.bak` of the old file. The old `settings.txt` window position is carried over.
+  7. Launch, and check FluxGPU stays running.
+- **Repair**: re-checks and rebuilds, re-points moved shortcuts and the startup entry, and offers to reset a damaged `settings.ini` while keeping the window position.
+- **Uninstall**: removes the shortcuts and the startup entry, and asks before deleting `%LOCALAPPDATA%\FluxGPU`. It never deletes the FluxGPU folder, and it only removes shortcuts that point at a FluxGPU.exe.
+- `-DryRun` shows every change without making it. `-Action Repair` and `-Action Uninstall` skip the menu.
+- Setup log in `%LOCALAPPDATA%\FluxGPU\logs\fluxgpu-setup-YYYY-MM-DD.log` with `MM-DD-YY HH:MM AM/PM` timestamps.
+- No admin, and no system-wide changes. `-ExecutionPolicy Bypass` applies to this one script only. Paths with spaces are handled.
+- `tools\Test-Setup.ps1`: 160 checks of the wizard logic and whole mocked runs of setup, repair, uninstall and a dry run. It changes nothing on the PC.
+
 ## 0.2.0 (11-26-26): trustworthy and safe
 
 This version has been compile-checked (C# 5, .NET Framework 4.8 reference assemblies) and its logic tested on Linux. It has **not yet been run on Windows**. See the Windows test checklist in the README.
