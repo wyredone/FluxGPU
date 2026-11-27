@@ -9,7 +9,7 @@ A small floating GPU monitor for Windows 11 that shows an NVIDIA compute card an
 
 It was made for a Tesla P40, which runs in TCC mode and so normally does not appear in Task Manager.
 
-Version 0.2.0. See [CHANGELOG.md](CHANGELOG.md).
+Version 0.2.0, with the setup wizard from 0.3.0-dev. See [CHANGELOG.md](CHANGELOG.md).
 
 ## What it shows
 
@@ -56,7 +56,47 @@ Throttle badges only show real slowdowns. "Power cap" is shown as information be
 
 If nvidia-smi stops responding (no output for 5 s), FluxGPU stops it and starts it again.
 
-## Build and run
+## Easy setup (recommended)
+
+```powershell
+git clone https://github.com/wyredone/FluxGPU.git
+```
+
+Then double-click **`setup.cmd`** in the FluxGPU folder (or run `.\FluxGPU\setup.cmd`). The wizard asks one numbered question at a time; press Enter to take the default.
+
+| Step | What it does |
+|---|---|
+| 1. Check Windows | Windows 11, 64-bit. Windows 10 gets a warning. Files marked "downloaded from the internet" in the FluxGPU folder are unblocked |
+| 2. Find the C# compiler | `csc.exe` from .NET Framework 4.x, and which version is installed |
+| 3. Find the GPUs | Looks for nvidia-smi in the same places as FluxGPU and runs one test query (10 s limit). Lets you type the path if it isn't found. Finds the AMD adapter and checks the Windows GPU counters |
+| 4. Build and test | Runs `build.cmd`, then `build.cmd test`, and shows the result |
+| 5. Shortcuts (optional) | Start menu shortcut, desktop shortcut, and start FluxGPU when you sign in |
+| 6. Settings (optional) | nvidia-smi path, your own temperature thresholds, alert sound. Written to `settings.ini` safely; the old file is kept as `settings.ini.bak` |
+| 7. Launch | Starts FluxGPU and checks it stays running |
+
+At the end it shows a PASS / WARN / FAIL summary. The setup log is `%LOCALAPPDATA%\FluxGPU\logs\fluxgpu-setup-YYYY-MM-DD.log`.
+
+The first menu also has:
+
+- **Repair**: checks again, rebuilds, points moved shortcuts and the startup entry at this folder, and offers to reset a damaged `settings.ini` (keeping the window position).
+- **Uninstall**: removes the shortcuts and the start-with-Windows entry, and **asks** before deleting `%LOCALAPPDATA%\FluxGPU` (settings and logs). The FluxGPU folder itself is never deleted.
+
+Safety:
+
+- **No admin needed.** Everything is per user: shortcuts in your own Start menu and desktop folders, start-with-Windows in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (value `FluxGPU`), and settings in `%LOCALAPPDATA%\FluxGPU`.
+- `setup.cmd` uses `-ExecutionPolicy Bypass` for this one script only. Your PowerShell execution policy is not changed.
+- Setup never changes anything outside your account. The one fix that needs admin, `lodctr /R` for broken GPU counters, is shown for you to run yourself.
+- Works with folder paths that contain spaces.
+
+Options: `setup.cmd -Action Repair`, `setup.cmd -Action Uninstall`, and `setup.cmd -DryRun`, which shows what would change without changing anything.
+
+The setup wizard has its own tests, which change nothing on the PC:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\FluxGPU\tools\Test-Setup.ps1
+```
+
+## Build and run by hand
 
 Requirements:
 
@@ -136,7 +176,11 @@ Log lines look like `11-26-26 05:41 PM [WARN] NVIDIA source state -> error: …`
 | AMD card shows an error about performance counters, or stays empty | The Windows performance counters may be damaged. In an admin terminal run `lodctr /R`, then restart FluxGPU. Counter names are only matched in English, so non-English Windows is not supported yet |
 | "AMD adapter changed, reconnecting…" | Expected after a driver update or after disabling and enabling the device. It clears by itself |
 | Build fails with a warning | Run `set FLUXGPU_ALLOW_WARNINGS=1` then `build.cmd`, and report the warning |
-| Anything else | Open the newest file in `%LOCALAPPDATA%\FluxGPU\logs` |
+| Setup says "does not look like the FluxGPU folder" | Run `setup.cmd` from the FluxGPU folder itself, next to `build.cmd` |
+| Setup: "The folder path contains a %" | Move the FluxGPU folder to a path without `%`, for example `C:\FluxGPU` |
+| Shortcuts stopped working after moving the folder | Run `setup.cmd -Action Repair` from the new location |
+| Settings you typed into settings.ini were lost | FluxGPU saves its settings when it closes. Close it first, or use setup step 6, which closes it for you |
+| Anything else | Open the newest file in `%LOCALAPPDATA%\FluxGPU\logs` (`fluxgpu-setup-*.log` for setup) |
 
 ## Windows test checklist (about 5 minutes)
 
@@ -173,6 +217,9 @@ Run this on the P40 PC before accepting a version. Write down pass or fail for e
 | `FluxGPU.cs` | The whole application (C# 5, WPF) |
 | `tests/FluxGPU.Tests.cs` | Pure-logic tests, built and run by `build.cmd test` |
 | `build.cmd` | Build script (app, tests and optional logo regeneration) |
+| `setup.cmd` | Setup wizard launcher (setup, repair, uninstall) |
+| `tools/Setup-FluxGPU.ps1` | The setup wizard (Windows PowerShell 5.1 or PowerShell 7) |
+| `tools/Test-Setup.ps1` | Setup wizard tests (mocked; changes nothing) |
 | `brand/BrandGen.cs` | Draws the logo and writes the SVG, PNG and ICO files |
 | `brand/` | Logo and icon files |
 | `CHANGELOG.md` | Version history |
